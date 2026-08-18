@@ -96,7 +96,25 @@ curl http://127.0.0.1:64130/v1/responses \
   -H "Content-Type: application/json" \
   -d '{"model": "gpt-4o", "previous_response_id": "<resp_id_from_previous_call>",
        "input": "And what about part two?"}'
+
+# Enable the llmcord-go "Show Sources" bridge appendix for this request
+curl http://127.0.0.1:64130/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4o", "include_sources": true,
+       "messages": [{"role": "user", "content": "Explain entropy in one sentence"}]}'
 ```
+
+## llmcord-go "Show Sources"
+
+When enabled, answers that have Perplexity web results get a trailing bridge
+appendix (`Sources` + `Search Queries` sections) in the exact format
+`llmcord-go`'s `FinalizeXAIResponseAnswer` parses for any provider — it is
+stripped from the visible reply and feeds the **Show Sources** button, the
+same contract the `grok-to-openai` proxy uses. Enable globally with
+`PPLX_INCLUDE_SOURCES=1` or per request with `include_sources: true` (in
+`llmcord-go`, set `extra_body: {include_sources: true}` on the
+`perlexity_to_openai` provider). Off by default so non-llmcord clients never
+see the appendix; multi-turn thread continuity keys on the clean answer text.
 
 ## Models
 
@@ -119,6 +137,7 @@ curl http://127.0.0.1:64130/v1/responses \
 | `PPLX_API_KEY` | *(none)* | if set, requires `Authorization: Bearer <key>` |
 | `PPLX_MAX_CONCURRENT` | `2` | max parallel asks per account |
 | `PPLX_TIMEZONE` | `UTC` | timezone reported to Perplexity |
+| `PPLX_INCLUDE_SOURCES` | `0` | append a "Sources" + "Search Queries" appendix to answers that have web results, for the **Show Sources** button in `llmcord-go` (see below); can also be enabled per request with `include_sources: true` |
 
 ## Behavior notes
 

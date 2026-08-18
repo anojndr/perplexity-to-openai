@@ -16,7 +16,8 @@ import secrets
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable, Optional
+from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
 from fastapi import FastAPI, HTTPException, Request
@@ -46,6 +47,7 @@ THREAD_LRU = 1024
 RESPONSE_LRU = 512
 FETCH_SIZE_CAP = 20 * 1024 * 1024
 TZ = os.environ.get("PPLX_TIMEZONE", "UTC")
+INCLUDE_SOURCES = os.environ.get("PPLX_INCLUDE_SOURCES", "0").strip().lower() in ("1", "true", "yes", "on")
 
 pool = AccountPool(ACCOUNTS_FILE, max_concurrent=MAX_CONCURRENT)
 threads: OrderedDict[str, ThreadState] = OrderedDict()   # conversation key -> Perplexity thread
@@ -317,6 +319,61 @@ def _url_citations(text: str, sources: list) -> list:
     return out
 
 
+SOURCE_APPENDIX_MAX = 50
+
+
+def _source_appendix(sources: list, query: str) -> str:
+    """Bridge source appendix for llmcord-go's "Show Sources" button.
+
+    Format mirrors grok-to-openai's source-attribution.js, which llmcord-go
+    parses for any provider (FinalizeXAIResponseAnswer strips it from the
+    visible answer and feeds it to Show Sources):
+        \n\nSources
+        1. [Title](url) (domain) via `query`
+
+        Search Queries
+        1. `query`
+    """
+    entries: list[str] = []
+    clean_query = query.replace("`", "'") if query else ""
+    for src in sources[:SOURCE_APPENDIX_MAX]:
+        if not isinstance(src, dict):
+            continue
+        url = (src.get("url") or "").strip().replace("\n", "").replace("\r", "")
+        # llmcord-go's markdown-link regex stops at ')' and whitespace.
+        url = url.replace(")", "%29").replace(" ", "%20")
+        if not url:
+            continue
+        title = ((src.get("title") or "").strip().replace("[", "").replace("]", "")) or url
+        entry = f"[{title}]({url})"
+        host = _host_of(url)
+        if title != url and host:
+            entry += f" ({host})"
+        if clean_query:
+            entry += f" via `{clean_query}`"
+        entries.append(entry)
+    if not entries:
+        return ""
+    lines = ["Sources"]
+    lines.extend(f"{i}. {entry}" for i, entry in enumerate(entries, start=1))
+    if clean_query:
+        lines.append("")
+        lines.append("Search Queries")
+        lines.append(f"1. `{clean_query}`")
+    return "\n\n" + "\n".join(lines)
+
+
+def _host_of(url: str) -> str:
+    try:
+        return (urlparse(url).netloc or "").lower()
+    except ValueError:
+        return ""
+
+
+def _include_sources(flag: Optional[bool]) -> bool:
+    return INCLUDE_SOURCES if flag is None else flag
+
+
 def _response_object(model: str, text: str, sources: list, *, request: dict,
                      prompt_tokens: int, completion_tokens: int,
                      previous_id: Optional[str] = None,
@@ -524,7 +581,8 @@ def _sse(data: dict) -> str:
 
 
 async def _stream_chat_completions(gen, *, completion_id: str, model: str, created: int,
-                                   prompt_tokens: int, include_usage: bool) -> AsyncIterator[str]:
+                                   prompt_tokens: int, include_usage: bool,
+                                   final_text: Callable[[], str] = lambda: "") -> AsyncIterator[str]:
     base = {"id": completion_id, "object": "chat.completion.chunk",
             "created": created, "model": model, "system_fingerprint": None}
     first = dict(base, choices=[{"index": 0, "delta": {"role": "assistant", "content": ""},
@@ -537,6 +595,12 @@ async def _stream_chat_completions(gen, *, completion_id: str, model: str, creat
             chunk = dict(base, choices=[{"index": 0, "delta": {"content": ev.text},
                                          "logprobs": None, "finish_reason": None}])
             yield _sse(chunk)
+    tail = final_text()
+    if tail:
+        completion_tokens += _est_tokens(tail)
+        chunk = dict(base, choices=[{"index": 0, "delta": {"content": tail},
+                                     "logprobs": None, "finish_reason": None}])
+        yield _sse(chunk)
     yield _sse(dict(base, choices=[{"index": 0, "delta": {},
                                     "logprobs": None, "finish_reason": "stop"}]))
     if include_usage:
@@ -627,6 +691,7 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = None
     user: Optional[str] = None
     metadata: Optional[dict] = None
+    include_sources: Optional[bool] = None
 
 
 @app.post("/v1/chat/completions")
@@ -654,9 +719,14 @@ async def chat_completions(req: ChatRequest):
             raise _http_from_ask_error(e)
         _register_thread(key, thread_out)
         _register_answer(text, thread_out)
-        return _chat_completion_response(
+        resp = _chat_completion_response(
             model, text, sources, request=req.model_dump(),
             prompt_tokens=prompt_tokens, completion_tokens=_est_tokens(text))
+        if _include_sources(req.include_sources):
+            appendix = _source_appendix(sources, query)
+            if appendix:
+                resp["choices"][0]["message"]["content"] = (text or "") + appendix
+        return resp
 
     include_usage = bool((req.stream_options or {}).get("include_usage"))
     completion_id = f"chatcmpl-{secrets.token_hex(12)}"
@@ -667,12 +737,18 @@ async def chat_completions(req: ChatRequest):
         try:
             thread_out = None
             text_parts: list[str] = []
+            sources: list = []
+
+            def appendix() -> str:
+                return _source_appendix(sources, query) if _include_sources(req.include_sources) else ""
 
             async def forward() -> AsyncIterator[AskEvent]:
-                nonlocal thread_out, text_parts
+                nonlocal thread_out, text_parts, sources
                 async for ev in gen:
                     if ev.kind == "text":
                         text_parts.append(ev.text)
+                    elif ev.kind == "sources":
+                        sources = ev.data.get("results", [])
                     elif ev.kind == "done":
                         thread_out = ev.data.get("thread")
                     yield ev
@@ -680,7 +756,7 @@ async def chat_completions(req: ChatRequest):
             async for chunk in _stream_chat_completions(
                     forward(), completion_id=completion_id, model=model,
                     created=created, prompt_tokens=prompt_tokens,
-                    include_usage=include_usage):
+                    include_usage=include_usage, final_text=appendix):
                 yield chunk
             if thread_out is not None:
                 _register_thread(key, thread_out)
@@ -716,6 +792,7 @@ class ResponsesRequest(BaseModel):
     text: object = None
     reasoning: object = None
     truncation: object = "disabled"
+    include_sources: Optional[bool] = None
 
 
 def _http_from_ask_error(e: AskError) -> HTTPException:
@@ -776,6 +853,10 @@ async def create_response(req: ResponsesRequest, request: Request):
                             prompt_tokens=prompt_tokens,
                             completion_tokens=_est_tokens(text),
                             previous_id=previous_id)
+    if _include_sources(req.include_sources):
+        appendix = _source_appendix(sources, query)
+        if appendix:
+            resp["output"][0]["content"][0]["text"] = (text or "") + appendix
     resp["_thread"] = thread_out
     _lru(responses, resp["id"], resp, cap=RESPONSE_LRU)
 
