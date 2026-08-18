@@ -1,0 +1,19 @@
+# Secrets — never commit account cookies
+accounts.txt
+accounts*.txt
+*.cookies
+*.cookie
+*.har
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Local state
+.jspace/
+*.log
+.env
+.DS_Store
