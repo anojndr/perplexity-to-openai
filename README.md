@@ -138,6 +138,7 @@ see the appendix; multi-turn thread continuity keys on the clean answer text.
 | `PPLX_MAX_CONCURRENT` | `2` | max parallel asks per account |
 | `PPLX_TIMEZONE` | `UTC` | timezone reported to Perplexity |
 | `PPLX_INCLUDE_SOURCES` | `0` | append a "Sources" + "Search Queries" appendix to answers that have web results, for the **Show Sources** button in `llmcord-go` (see below); can also be enabled per request with `include_sources: true` |
+| `PPLX_DB_PATH` | `state.db` | SQLite file for persistent state (threads, answer anchors, responses) |
 
 ## Behavior notes
 
@@ -148,6 +149,7 @@ see the appendix; multi-turn thread continuity keys on the clean answer text.
   (stale thread handle recovery).
 - `internet` answer mode currently fails on free accounts (Perplexity-side);
   `copilot`/`concise` are the defaults.
-- Thread state is in-memory (LRU 1024); restarting the server starts fresh
-  conversations. Responses are retained in-memory (LRU 512) so
-  `/v1/responses/{id}` and `previous_response_id` work within one process.
+- Thread state, answer anchors and responses persist in SQLite (`state.db`,
+  WAL mode; LRU 1024 threads / 512 responses), so restarting the server keeps
+  conversations going: multi-turn continuity via history-hash or echoed-answer
+  matching and `previous_response_id` / `/v1/responses/{id}` survive restarts.

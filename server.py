@@ -7,6 +7,7 @@ to Perplexity's backend_uuid/read_write_token handle.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -14,7 +15,6 @@ import logging
 import os
 import secrets
 import time
-from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Callable, Optional
 from urllib.parse import urlparse
@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from account_pool import AccountPool
+from db_store import Store
 from pplx_transport import (
     AskError,
     AskEvent,
@@ -50,35 +51,24 @@ TZ = os.environ.get("PPLX_TIMEZONE", "UTC")
 INCLUDE_SOURCES = os.environ.get("PPLX_INCLUDE_SOURCES", "0").strip().lower() in ("1", "true", "yes", "on")
 
 pool = AccountPool(ACCOUNTS_FILE, max_concurrent=MAX_CONCURRENT)
-threads: OrderedDict[str, ThreadState] = OrderedDict()   # conversation key -> Perplexity thread
-threads_by_answer: OrderedDict[str, ThreadState] = OrderedDict()  # sha256(last assistant text) -> thread
-responses: OrderedDict[str, dict] = OrderedDict()        # resp id -> response object
+store = Store()
 
 
-def _lru(store: OrderedDict, key: str, value=None, cap: int = THREAD_LRU):
-    if key in store:
-        store.move_to_end(key)
-    elif value is not None:
-        store[key] = value
-        while len(store) > cap:
-            store.popitem(last=False)
-    return store.get(key)
-
-
-def _register_thread(key: str, thread_state: ThreadState) -> ThreadState:
-    _lru(threads, key, thread_state)
+async def _register_thread(key: str, thread_state: ThreadState) -> ThreadState:
+    await asyncio.to_thread(store.save_thread, key, thread_state, THREAD_LRU)
     return thread_state
 
 
-def _register_answer(answer: str, thread_state: ThreadState) -> None:
+async def _register_answer(answer: str, thread_state: ThreadState) -> None:
     """Associate a thread with its answer text so the client's echo of that
     answer on the next turn identifies the same Perplexity conversation."""
     if answer:
-        _lru(threads_by_answer, hashlib.sha256(answer.encode()).hexdigest(),
-             thread_state, cap=THREAD_LRU)
+        anchor = hashlib.sha256(answer.encode()).hexdigest()
+        await asyncio.to_thread(store.save_thread_by_answer,
+                                anchor, thread_state, THREAD_LRU)
 
 
-def _lookup_thread(messages: list) -> tuple[Optional[ThreadState], Optional[str]]:
+async def _lookup_thread(messages: list) -> tuple[Optional[ThreadState], Optional[str]]:
     """Find the Perplexity thread for a messages list.
 
     Strategy: the OpenAI SDK resends the full history; the message right
@@ -99,11 +89,11 @@ def _lookup_thread(messages: list) -> tuple[Optional[ThreadState], Optional[str]
             content = "".join(_text_of_part(p) for p in content)
         if isinstance(content, str) and content:
             anchor = hashlib.sha256(content.encode()).hexdigest()
-            found = threads_by_answer.get(anchor)
+            found = await asyncio.to_thread(store.get_thread_by_answer, anchor)
             if found is not None:
                 return found, anchor
         history = _conversation_key(messages[:last_user])
-        found = threads.get(history)
+        found = await asyncio.to_thread(store.get_thread, history)
         if found is not None:
             return found, None
     return None, None
@@ -778,7 +768,8 @@ async def api_key_middleware(request: Request, call_next):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "accounts": pool.size, "accounts_detail": pool.status(),
-            "threads": len(threads), "responses": len(responses)}
+            "threads": await asyncio.to_thread(store.count_threads),
+            "responses": await asyncio.to_thread(store.count_responses)}
 
 
 MODEL_LIST = [
@@ -818,7 +809,7 @@ async def chat_completions(req: ChatRequest):
             "error": {"message": "No user message with content found",
                       "type": "invalid_request_error", "code": "invalid_request"}})
     key = _conversation_key(history)
-    thread, answer_anchor = _lookup_thread(req.messages)
+    thread, answer_anchor = await _lookup_thread(req.messages)
 
     prompt_tokens = _est_tokens(query) + sum(_est_tokens(h.get("content", "")) for h in history)
 
@@ -831,8 +822,8 @@ async def chat_completions(req: ChatRequest):
             thread_out, text, sources, related = await _collect_ask(query, **ask_kw())
         except AskError as e:
             raise _http_from_ask_error(e)
-        _register_thread(key, thread_out)
-        _register_answer(text, thread_out)
+        await _register_thread(key, thread_out)
+        await _register_answer(text, thread_out)
         resp = _chat_completion_response(
             model, text, sources, request=req.model_dump(),
             prompt_tokens=prompt_tokens, completion_tokens=_est_tokens(text))
@@ -873,8 +864,8 @@ async def chat_completions(req: ChatRequest):
                     include_usage=include_usage, final_text=appendix):
                 yield chunk
             if thread_out is not None:
-                _register_thread(key, thread_out)
-                _register_answer("".join(text_parts), thread_out)
+                await _register_thread(key, thread_out)
+                await _register_answer("".join(text_parts), thread_out)
         except AskError as e:
             yield _sse_error(e)
 
@@ -936,7 +927,7 @@ async def create_response(req: ResponsesRequest, request: Request):
     thread: Optional[ThreadState] = None
     previous_id = req.previous_response_id
     if previous_id:
-        prev = responses.get(previous_id)
+        prev = await asyncio.to_thread(store.get_response, previous_id)
         if prev is None:
             return JSONResponse(status_code=400, content={
                 "error": {"message": "Unknown previous_response_id",
@@ -945,10 +936,10 @@ async def create_response(req: ResponsesRequest, request: Request):
         thread = prev.get("_thread")
     else:
         raw_items = req.input if isinstance(req.input, list) else []
-        thread, _ = _lookup_thread(raw_items)
+        thread, _ = await _lookup_thread(raw_items)
         if thread is None:
             key = _conversation_key(history)
-            thread = _lru(threads, key)
+            thread = await asyncio.to_thread(store.get_thread, key)
 
     prompt_tokens = _est_tokens(query) + sum(_est_tokens(h.get("content", "")) for h in history)
 
@@ -962,10 +953,8 @@ async def create_response(req: ResponsesRequest, request: Request):
         except AskError as e:
             raise _http_from_ask_error(e)
 
-        if thread is None:
-            key = _conversation_key(history)
-            _register_thread(key, thread_out)
-        _register_answer(text, thread_out)
+        await _register_thread(_conversation_key(history), thread_out)
+        await _register_answer(text, thread_out)
         resp = _response_object(model, text, sources, request=req.model_dump(),
                                 prompt_tokens=prompt_tokens,
                                 completion_tokens=_est_tokens(text),
@@ -975,7 +964,8 @@ async def create_response(req: ResponsesRequest, request: Request):
             if appendix:
                 resp["output"][0]["content"][0]["text"] = (text or "") + appendix
         resp["_thread"] = thread_out
-        _lru(responses, resp["id"], resp, cap=RESPONSE_LRU)
+        await asyncio.to_thread(store.save_response, resp["id"], resp,
+                                cap=RESPONSE_LRU)
         out = dict(resp)
         out.pop("_thread", None)
         return out
@@ -1010,19 +1000,18 @@ async def create_response(req: ResponsesRequest, request: Request):
             if completed_resp is not None:
                 final_stored = dict(completed_resp)
                 final_stored["_thread"] = thread_out
-                _lru(responses, resp_id, final_stored, cap=RESPONSE_LRU)
+                await asyncio.to_thread(store.save_response, resp_id,
+                                        final_stored, cap=RESPONSE_LRU)
 
             if thread_out is not None:
-                if thread is None:
-                    key = _conversation_key(history)
-                    _register_thread(key, thread_out)
+                await _register_thread(_conversation_key(history), thread_out)
                 if completed_resp:
                     out_text = ""
                     try:
                         out_text = completed_resp["output"][0]["content"][0].get("text", "")
                     except Exception:
                         pass
-                    _register_answer(out_text, thread_out)
+                    await _register_answer(out_text, thread_out)
         except AskError as e:
             yield _sse_error(e)
 
@@ -1032,7 +1021,7 @@ async def create_response(req: ResponsesRequest, request: Request):
 
 @app.get("/v1/responses/{response_id}")
 async def get_response(response_id: str):
-    resp = responses.get(response_id)
+    resp = await asyncio.to_thread(store.get_response, response_id)
     if resp is None:
         raise HTTPException(status_code=404, detail={
             "message": f"No response found with id {response_id}",
