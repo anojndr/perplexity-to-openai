@@ -615,24 +615,138 @@ async def _stream_chat_completions(gen, *, completion_id: str, model: str, creat
     yield "data: [DONE]\n\n"
 
 
-def _responses_events(resp: dict):
-    """Yield Responses-API event dicts for a completed response."""
-    yield {"type": "response.created", "response": resp}
-    yield {"type": "response.in_progress", "response": resp}
-    item = resp["output"][0]
-    yield {"type": "response.output_item.added", "output_index": 0, "item": dict(item, content=[])}
-    part = item["content"][0]
-    yield {"type": "response.content_part.added", "item_id": item["id"], "output_index": 0,
-           "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}
-    text = part["text"]
-    yield {"type": "response.output_text.delta", "item_id": item["id"], "output_index": 0,
-           "content_index": 0, "delta": text}
-    yield {"type": "response.output_text.done", "item_id": item["id"], "output_index": 0,
-           "content_index": 0, "text": text, "annotations": part["annotations"]}
-    yield {"type": "response.content_part.done", "item_id": item["id"], "output_index": 0,
-           "content_index": 0, "part": part}
-    yield {"type": "response.output_item.done", "output_index": 0, "item": item}
-    yield {"type": "response.completed", "response": resp}
+async def _stream_responses(gen, *, model: str, request: dict, prompt_tokens: int,
+                            resp_id: Optional[str] = None, msg_id: Optional[str] = None,
+                            previous_id: Optional[str] = None,
+                            final_text: Callable[[list], str] = lambda s: "") -> AsyncIterator[tuple[dict, str]]:
+    """Stream real-time Responses API events as AskEvents arrive from upstream."""
+    resp_id = resp_id or f"resp_{secrets.token_hex(12)}"
+    msg_id = msg_id or f"msg_{secrets.token_hex(12)}"
+    created = _now()
+
+    resp_in_prog = {
+        "id": resp_id,
+        "object": "response",
+        "created_at": created,
+        "status": "in_progress",
+        "completed_at": None,
+        "background": False,
+        "error": None,
+        "incomplete_details": None,
+        "instructions": request.get("instructions"),
+        "max_output_tokens": request.get("max_output_tokens"),
+        "max_tool_calls": None,
+        "model": model,
+        "output": [],
+        "parallel_tool_calls": True,
+        "previous_response_id": previous_id,
+        "reasoning": {"effort": None, "summary": None},
+        "service_tier": "default",
+        "store": bool(request.get("store", True)),
+        "temperature": request.get("temperature"),
+        "text": {"format": request.get("text") or {"type": "text"}},
+        "tool_choice": request.get("tool_choice", "auto"),
+        "tools": request.get("tools", []),
+        "top_logprobs": 0,
+        "top_p": request.get("top_p"),
+        "truncation": request.get("truncation", "disabled"),
+        "usage": None,
+        "user": request.get("user"),
+        "metadata": request.get("metadata") or {},
+    }
+
+    yield resp_in_prog, _sse({"type": "response.created", "response": resp_in_prog})
+    yield resp_in_prog, _sse({"type": "response.in_progress", "response": resp_in_prog})
+
+    output_item_in_prog = {
+        "id": msg_id,
+        "type": "message",
+        "status": "in_progress",
+        "role": "assistant",
+        "content": [],
+    }
+    yield resp_in_prog, _sse({"type": "response.output_item.added", "output_index": 0,
+                              "item": output_item_in_prog})
+    yield resp_in_prog, _sse({"type": "response.content_part.added", "item_id": msg_id,
+                              "output_index": 0, "content_index": 0,
+                              "part": {"type": "output_text", "text": "", "annotations": []}})
+
+    accumulated_text: list[str] = []
+    sources: list = []
+
+    async for ev in gen:
+        if ev.kind == "sources":
+            sources = ev.data.get("results", [])
+        elif ev.kind == "text":
+            if ev.text:
+                accumulated_text.append(ev.text)
+                yield resp_in_prog, _sse({
+                    "type": "response.output_text.delta",
+                    "item_id": msg_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": ev.text,
+                })
+
+    appendix = final_text(sources)
+    if appendix:
+        accumulated_text.append(appendix)
+        yield resp_in_prog, _sse({
+            "type": "response.output_text.delta",
+            "item_id": msg_id,
+            "output_index": 0,
+            "content_index": 0,
+            "delta": appendix,
+        })
+
+    full_text = "".join(accumulated_text)
+    annotations = _url_citations(full_text, sources)
+    content_part = {"type": "output_text", "text": full_text, "annotations": annotations}
+    output_item_done = {
+        "id": msg_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [content_part],
+    }
+
+    yield resp_in_prog, _sse({
+        "type": "response.output_text.done",
+        "item_id": msg_id,
+        "output_index": 0,
+        "content_index": 0,
+        "text": full_text,
+        "annotations": annotations,
+    })
+    yield resp_in_prog, _sse({
+        "type": "response.content_part.done",
+        "item_id": msg_id,
+        "output_index": 0,
+        "content_index": 0,
+        "part": content_part,
+    })
+    yield resp_in_prog, _sse({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": output_item_done,
+    })
+
+    completion_tokens = _est_tokens(full_text)
+    resp_completed = dict(
+        resp_in_prog,
+        status="completed",
+        completed_at=_now(),
+        output=[output_item_done],
+        usage={
+            "input_tokens": prompt_tokens,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens": completion_tokens,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    )
+
+    yield resp_completed, _sse({"type": "response.completed", "response": resp_completed})
 
 
 # --------------------------------------------------------------------------
@@ -838,38 +952,79 @@ async def create_response(req: ResponsesRequest, request: Request):
 
     prompt_tokens = _est_tokens(query) + sum(_est_tokens(h.get("content", "")) for h in history)
 
-    try:
-        thread_out, text, sources, related = await _collect_ask(
-            query, model=model, mode=mode, attachments=attachments,
-            thread=thread, system=system, previous_id=previous_id)
-    except AskError as e:
-        raise _http_from_ask_error(e)
-
-    if thread is None:
-        key = _conversation_key(history)
-        _register_thread(key, thread_out)
-    _register_answer(text, thread_out)
-    resp = _response_object(model, text, sources, request=req.model_dump(),
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=_est_tokens(text),
-                            previous_id=previous_id)
-    if _include_sources(req.include_sources):
-        appendix = _source_appendix(sources, query)
-        if appendix:
-            resp["output"][0]["content"][0]["text"] = (text or "") + appendix
-    resp["_thread"] = thread_out
-    _lru(responses, resp["id"], resp, cap=RESPONSE_LRU)
+    def ask_kw():
+        return dict(model=model, mode=mode, attachments=attachments,
+                    thread=thread, system=system, previous_id=previous_id)
 
     if not req.stream:
+        try:
+            thread_out, text, sources, related = await _collect_ask(query, **ask_kw())
+        except AskError as e:
+            raise _http_from_ask_error(e)
+
+        if thread is None:
+            key = _conversation_key(history)
+            _register_thread(key, thread_out)
+        _register_answer(text, thread_out)
+        resp = _response_object(model, text, sources, request=req.model_dump(),
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=_est_tokens(text),
+                                previous_id=previous_id)
+        if _include_sources(req.include_sources):
+            appendix = _source_appendix(sources, query)
+            if appendix:
+                resp["output"][0]["content"][0]["text"] = (text or "") + appendix
+        resp["_thread"] = thread_out
+        _lru(responses, resp["id"], resp, cap=RESPONSE_LRU)
         out = dict(resp)
         out.pop("_thread", None)
         return out
 
+    resp_id = f"resp_{secrets.token_hex(12)}"
+    msg_id = f"msg_{secrets.token_hex(12)}"
+
     async def sse_gen():
-        out = dict(resp)
-        out.pop("_thread", None)
-        for ev in _responses_events(out):
-            yield _sse(ev)
+        gen = _stream_with_accounts(query, **ask_kw())
+        try:
+            thread_out = None
+
+            def appendix(srcs: list) -> str:
+                return _source_appendix(srcs, query) if _include_sources(req.include_sources) else ""
+
+            async def forward() -> AsyncIterator[AskEvent]:
+                nonlocal thread_out
+                async for ev in gen:
+                    if ev.kind == "done":
+                        thread_out = ev.data.get("thread")
+                    yield ev
+
+            completed_resp = None
+            async for resp_obj, sse_chunk in _stream_responses(
+                    forward(), model=model, request=req.model_dump(),
+                    prompt_tokens=prompt_tokens, resp_id=resp_id,
+                    msg_id=msg_id, previous_id=previous_id,
+                    final_text=appendix):
+                completed_resp = resp_obj
+                yield sse_chunk
+
+            if completed_resp is not None:
+                final_stored = dict(completed_resp)
+                final_stored["_thread"] = thread_out
+                _lru(responses, resp_id, final_stored, cap=RESPONSE_LRU)
+
+            if thread_out is not None:
+                if thread is None:
+                    key = _conversation_key(history)
+                    _register_thread(key, thread_out)
+                if completed_resp:
+                    out_text = ""
+                    try:
+                        out_text = completed_resp["output"][0]["content"][0].get("text", "")
+                    except Exception:
+                        pass
+                    _register_answer(out_text, thread_out)
+        except AskError as e:
+            yield _sse_error(e)
 
     return StreamingResponse(sse_gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
