@@ -1,3 +1,4 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 curl_cffi>=0.9
+pydantic>=2.0

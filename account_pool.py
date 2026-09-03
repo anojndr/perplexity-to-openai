@@ -10,6 +10,7 @@ The file is re-read when its mtime changes, so adding accounts takes effect
 without restarting the server. Accounts are skipped while quota-exhausted,
 failing, or cooling down; selection prefers the least-loaded healthy account.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -17,22 +18,27 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional, TypedDict
 
 from pplx_transport import PerplexityClient
 
 log = logging.getLogger("pplx.accounts")
 
-QUOTA_TTL = 120.0       # rate-limit/status cache
-COOLDOWN = 300.0        # after consecutive failures
-FAIL_THRESHOLD = 3      # consecutive failures -> cooldown
+QUOTA_TTL = 120.0  # rate-limit/status cache
+COOLDOWN = 300.0  # after consecutive failures
+FAIL_THRESHOLD = 3  # consecutive failures -> cooldown
+
+
+class AccountSpec(TypedDict):
+    label: str
+    cookies: dict[str, str]
 
 
 @dataclass
 class Account:
     index: int
     label: str
-    cookies: dict
+    cookies: dict[str, str]
     client: PerplexityClient
     active: int = 0
     consecutive_failures: int = 0
@@ -49,10 +55,10 @@ class Account:
         return True
 
 
-def parse_accounts(path: str) -> list[dict]:
+def parse_accounts(path: str) -> list[AccountSpec]:
     """Parse the Netscape-cookie account file into cookie dicts."""
-    accounts: list[dict] = []
-    current: Optional[dict] = None
+    accounts: list[AccountSpec] = []
+    current: AccountSpec | None = None
     with open(path, "r", encoding="utf-8") as fh:
         for raw in fh:
             line = raw.strip()
@@ -97,7 +103,11 @@ class AccountPool:
             log.error("failed to parse accounts: %s", e)
             return
         async with self._lock:
-            if self._mtime is not None and self._mtime == st.st_mtime and self._accounts:
+            if (
+                self._mtime is not None
+                and self._mtime == st.st_mtime
+                and self._accounts
+            ):
                 return
             # Keep existing clients for unchanged accounts (session reuse).
             existing = {a.index: a for a in self._accounts}
@@ -109,17 +119,20 @@ class AccountPool:
                 else:
                     if old is not None:
                         await old.client.close()
-                    new_list.append(Account(
-                        index=i, label=spec["label"], cookies=spec["cookies"],
-                        client=PerplexityClient(
-                            spec["cookies"],
-                            max_concurrent=self.max_concurrent,
-                        ),
-                    ))
+                    new_list.append(
+                        Account(
+                            index=i,
+                            label=spec["label"],
+                            cookies=spec["cookies"],
+                            client=PerplexityClient(
+                                spec["cookies"],
+                                max_concurrent=self.max_concurrent,
+                            ),
+                        )
+                    )
             self._accounts = new_list
             self._semaphores = {
-                a.index: asyncio.Semaphore(self.max_concurrent)
-                for a in new_list
+                a.index: asyncio.Semaphore(self.max_concurrent) for a in new_list
             }
             self._mtime = st.st_mtime
             log.info("accounts loaded: %d", len(new_list))
@@ -155,7 +168,9 @@ class AccountPool:
             candidates = [a for a in candidates if a.healthy(time.time())]
             if not candidates:
                 return None
-            candidates.sort(key=lambda a: (a.active, (a.index - self._rr) % len(self._accounts)))
+            candidates.sort(
+                key=lambda a: (a.active, (a.index - self._rr) % len(self._accounts))
+            )
             self._rr = (self._rr + 1) % max(len(self._accounts), 1)
             acct = candidates[0]
             return acct, self._semaphores[acct.index]
@@ -184,17 +199,20 @@ class AccountPool:
             acct.consecutive_failures = 0
             log.warning("account %d cooling down: %s", acct.index, error)
 
-    def status(self) -> list[dict]:
+    def status(self) -> list[dict[str, Any]]:
         now = time.time()
-        return [{
-            "index": a.index,
-            "label": a.label,
-            "active": a.active,
-            "healthy": a.healthy(now),
-            "quota_available": a.quota_known,
-            "last_error": a.last_error,
-            "cooldown_until": a.cooldown_until,
-        } for a in self._accounts]
+        return [
+            {
+                "index": a.index,
+                "label": a.label,
+                "active": a.active,
+                "healthy": a.healthy(now),
+                "quota_available": a.quota_known,
+                "last_error": a.last_error,
+                "cooldown_until": a.cooldown_until,
+            }
+            for a in self._accounts
+        ]
 
     async def close(self) -> None:
         for a in self._accounts:
